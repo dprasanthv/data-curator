@@ -69,14 +69,124 @@ data-curator/
 └── label-studio-data/          # LS internal state (sqlite, etc.)
 ```
 
+## How data moves between components
+
+This section traces a single event end-to-end so you can see what actually happens at each hop and what shape the data takes.
+
+### Hop 1 — Producer → Kafka
+
+The `producer` container generates a fake event with `Faker` and publishes it as JSON to the `facebook.events` Kafka topic.
+
+```json
+{
+  "event_id": "8f3c…",
+  "event_type": "post",
+  "created_at": "2026-04-27T20:51:11Z",
+  "actor": { "user_id": "u-42", "name": "Alice Smith" },
+  "post": { "post_id": "p-99", "text": "Just deployed my first DAG!" }
+}
+```
+
+**Transport:** Kafka (KRaft single-node, port 9092 internally, 9092 published to host).
+**Inspect:** Kafbat UI → topic `facebook.events` → Messages.
+
+### Hop 2 — Kafka → Bronze (Parquet on disk)
+
+DAG `kafka_to_datalake_bronze` runs every few minutes. It opens a `KafkaConsumer`, drains a batch of messages, and writes them as a single Snappy-compressed Parquet file partitioned by date and hour.
+
+```
+datalake/bronze/facebook_events/
+└── dt=2026-04-27/
+    └── hour=20/
+        └── events-20260427T205111-<uuid>.parquet
+```
+
+Each row preserves the original JSON structure (nested `actor`, `post`, etc.). The Parquet schema is inferred by PyArrow from the dict.
+
+**Why Parquet?** Columnar, compressed, fast to scan from downstream tools without re-decoding JSON.
+
+### Hop 3a — Bronze → Label Studio (text track, optional)
+
+DAG `parquet_to_label_studio` reads recent bronze files and converts each event into a Label Studio task. The `text` field is built per `event_type`:
+
+| `event_type` | `text` value |
+|---|---|
+| `post` | `post.text` |
+| `comment` | `comment.text` |
+| `reaction` | `"reacted with <reaction_type> on <target_type>"` |
+| `follow` | `"followed user <followed_user_name>"` |
+| `user` | `"user registered: <name>"` |
+
+Tasks are written first as JSONL (one task per line) into `datalake/label-studio/tasks/`, then POSTed to Label Studio's `/api/projects/{id}/import` endpoint.
+
+```jsonl
+{"data": {"text": "Just deployed my first DAG!", "event_type": "post", "event_id": "8f3c…", ...}}
+```
+
+A human then opens Label Studio → "Facebook Events" project and clicks `safe` / `spam` / `hate` / `harassment` for each task.
+
+### Hop 3b — Bronze → Gold text embeddings (no human in the loop)
+
+DAG `text_embeddings` reads bronze Parquet **directly** (skipping Label Studio entirely), assigns random labels, and embeds. Two tasks:
+
+1. **`load_and_label`** — globs all `bronze/facebook_events/**/*.parquet`, extracts the `text` field per `event_type`, attaches a random label, and caches the records as JSON in `datalake/tmp/`.
+2. **`generate_embeddings`** — for each batch of 64 texts:
+   - **Tokenize:** WordPiece → `input_ids` of shape `[64, ≤128]`
+   - **Forward pass:** `AutoModel.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")` → token embeddings `[64, seq_len, 384]`
+   - **Mean-pool** across the sequence dimension (ignoring `[PAD]`) → `[64, 384]`
+   - **L2-normalise** → unit vectors
+   - **Append** to a Parquet file via `pq.ParquetWriter`, flushing every 2,000 rows to keep memory bounded.
+
+Final output:
+
+```
+datalake/gold/text_embeddings/embeddings_<UTC-timestamp>.parquet
+```
+
+### Hop 4 — Image track (LoremFlickr → Label Studio → CLIP)
+
+DAG `image_pipeline`:
+
+1. Downloads images from LoremFlickr into `datalake/images/{building,people,car}/`.
+2. Creates a Label Studio project with image classification config.
+3. Imports each image as a task whose `data.image` URL points at Label Studio's local files endpoint:
+   ```
+   /data/local-files/?d=images/building/building_0001.jpg
+   ```
+   Label Studio resolves `?d=…` against `LOCAL_FILES_DOCUMENT_ROOT=/data`, which is the bind-mounted `./datalake` folder.
+
+A human annotates the images. Then DAG `image_embeddings`:
+
+1. **`export_annotations`** — calls `/api/projects/{id}/export?exportType=JSON`, keeps only annotated tasks, caches them in `datalake/tmp/ls_annotations.json`.
+2. **`generate_embeddings`** — for each batch:
+   - Reverse the `?d=…` URL back into a real disk path.
+   - Open with PIL, convert to RGB.
+   - `CLIPProcessor` → resize to 224×224 + normalise.
+   - `CLIPModel.get_image_features()` → `[batch, 512]`.
+   - L2-normalise.
+   - Write a single Parquet file with `task_id`, `label`, `image_path`, `embedding`.
+
+### Volume mounts that make all of this work
+
+The same `./datalake` folder on your host is mounted into multiple containers:
+
+| Mount target | Container | Why |
+|---|---|---|
+| `/opt/airflow/datalake` | `airflow-webserver`, `airflow-scheduler`, `airflow-init` | DAGs read/write bronze + gold Parquet here |
+| `/data` | `label-studio` | Label Studio serves images from here via `LOCAL_FILES_DOCUMENT_ROOT` |
+
+Because both containers see the same physical files, an image written by Airflow's `image_pipeline` is immediately visible to Label Studio without any copy step.
+
 ## Prerequisites
 
 - Docker Desktop (4 GB RAM minimum, 8 GB recommended — model loading is heavy)
 - ~2 GB free disk for Docker images (CLIP weights are baked in at build time)
 
-## Running it
+## Running it — full data creation walkthrough
 
-### 1. Build & start everything
+This is the complete sequence to go from a fresh clone to populated bronze + gold layers.
+
+### Step 1 — Build & start everything
 
 ```bash
 docker-compose up -d --build
@@ -84,7 +194,15 @@ docker-compose up -d --build
 
 First build takes 5–10 minutes — it installs PyTorch and pre-downloads the CLIP model weights into the Airflow image (this avoids macOS Docker volume rename bugs at runtime).
 
-### 2. Open the UIs
+Wait for all containers to be healthy:
+
+```bash
+docker-compose ps
+```
+
+You should see `kafka`, `producer`, `airflow-postgres`, `airflow-init` (exited 0), `airflow-webserver`, `airflow-scheduler`, `kafbat`, `label-studio` all running.
+
+### Step 2 — Open the UIs
 
 | Service | URL | Credentials |
 |---|---|---|
@@ -92,39 +210,128 @@ First build takes 5–10 minutes — it installs PyTorch and pre-downloads the C
 | **Label Studio** | http://localhost:8081 | `admin@datacurator.local` / `admin` |
 | **Kafbat (Kafka UI)** | http://localhost:8082 | none |
 
-### 3. Watch data flow in
+### Step 3 — Generate Kafka events (automatic)
 
-The producer starts emitting events immediately (one every 250 ms). Within a few minutes you should see:
+The `producer` container starts immediately and emits one synthetic Facebook event every 250 ms to topic `facebook.events`. Each event is one of:
 
-- Events flowing in Kafbat under topic `facebook.events`
-- The `kafka_to_datalake_bronze` DAG running every few minutes, dropping Parquet files into `datalake/bronze/facebook_events/`
-- The `parquet_to_label_studio` DAG converting those into JSONL and importing them into a "Facebook Events" project in Label Studio
+- **`post`** — user creates a post with text
+- **`comment`** — user comments on a post
+- **`reaction`** — user reacts (like / love / haha / ...) to a post or comment
+- **`follow`** — user follows another user
+- **`user`** — new user registration
 
-### 4. Generate text embeddings
+**Verify:** open Kafbat → topic `facebook.events` → Messages tab. You should see events arriving in real time.
 
-This DAG reads directly from the bronze Parquet, assigns random labels, tokenizes, and embeds — no Label Studio interaction required:
+### Step 4 — Land events into the bronze datalake
 
-```bash
-docker-compose exec airflow-scheduler airflow dags test text_embeddings 2024-01-01
+The `kafka_to_datalake_bronze` DAG runs on a schedule, consuming from Kafka and writing partitioned Parquet:
+
+```
+datalake/bronze/facebook_events/dt=YYYY-MM-DD/hour=HH/events-*.parquet
 ```
 
-Output → `datalake/gold/text_embeddings/embeddings_<timestamp>.parquet`
+It's enabled by default and runs every few minutes. To force-run it once:
 
-### 5. Generate image embeddings
+```bash
+docker-compose exec airflow-scheduler airflow dags test kafka_to_datalake_bronze 2024-01-01
+```
 
-Trigger the image pipeline first (downloads images and imports them into Label Studio):
+**Verify:**
+
+```bash
+ls datalake/bronze/facebook_events/dt=*/hour=*/ | head
+```
+
+After 5 minutes of producer runtime you should have ~1,000+ events spread across multiple Parquet files.
+
+### Step 5 — Push events into Label Studio (optional, for manual annotation)
+
+If you want to label events in the UI instead of randomly via script, run:
+
+```bash
+docker-compose exec airflow-scheduler airflow dags test parquet_to_label_studio 2024-01-01
+```
+
+This DAG:
+1. Reads recent bronze Parquet files
+2. Converts each event to a Label Studio task JSONL line
+3. Creates (or finds) the "Facebook Events" project with `safe / spam / hate / harassment` labels
+4. POSTs the tasks to Label Studio
+
+**Verify:** open Label Studio → "Facebook Events" project. You should see tasks queued for annotation.
+
+### Step 6 — Download images for the image track
 
 ```bash
 docker-compose exec airflow-scheduler airflow dags test image_pipeline 2024-01-01
 ```
 
-Annotate at least a handful of images in Label Studio, then run:
+This DAG:
+1. Downloads images from LoremFlickr into `datalake/images/{building, people, car}/`
+2. Creates a Label Studio project "Image Classification: Building / People / Car"
+3. Imports each image as a task pointing to its local file URL
+
+**Verify:**
+
+```bash
+ls datalake/images/building | head
+ls datalake/images/people | head
+ls datalake/images/car | head
+```
+
+Then open Label Studio and **annotate at least a few images** (the image embedding DAG only embeds annotated ones).
+
+### Step 7 — Generate text embeddings (gold layer)
+
+This DAG bypasses Label Studio entirely — it reads bronze Parquet directly, assigns random labels, tokenizes (BERT WordPiece), and embeds with MiniLM:
+
+```bash
+docker-compose exec airflow-scheduler airflow dags test text_embeddings 2024-01-01
+```
+
+For ~25k events on CPU this takes ~10 minutes. Output:
+
+```
+datalake/gold/text_embeddings/embeddings_<UTC-timestamp>.parquet
+```
+
+**Verify:**
+
+```bash
+ls -lh datalake/gold/text_embeddings/
+```
+
+### Step 8 — Generate image embeddings (gold layer)
+
+This DAG exports annotations from Label Studio and runs CLIP on each annotated image:
 
 ```bash
 docker-compose exec airflow-scheduler airflow dags test image_embeddings 2024-01-01
 ```
 
-Output → `datalake/gold/image_embeddings/embeddings_<timestamp>.parquet`
+Output:
+
+```
+datalake/gold/image_embeddings/embeddings_<UTC-timestamp>.parquet
+```
+
+**Verify:**
+
+```bash
+ls -lh datalake/gold/image_embeddings/
+```
+
+### Quick recap — DAG dependency map
+
+```
+producer  ──► kafka_to_datalake_bronze  ──► text_embeddings           (random labelling)
+                          │
+                          └──────────────► parquet_to_label_studio    (manual labelling)
+
+image_pipeline  ──► [manual annotation]  ──► image_embeddings
+```
+
+You can run the text track end-to-end without any human labelling. The image track requires you to click through at least a few images in Label Studio.
 
 ## Output schema
 
