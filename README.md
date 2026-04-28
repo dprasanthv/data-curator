@@ -16,6 +16,21 @@ An end-to-end data pipeline that streams synthetic social media events through K
                             │       Gold layer (Parquet)           │
                             │  • text embeddings  (MiniLM, 384-d)  │
                             │  • image embeddings (CLIP,  512-d)   │
+                            └──────────────────┬───────────────────┘
+                                               │
+                                               ▼
+                            ┌──────────────────────────────────────┐
+                            │      Qdrant vector DB (cosine)       │
+                            │  • facebook_text_events  (384-d)     │
+                            │  • image_classification  (512-d)     │
+                            └──────────────────┬───────────────────┘
+                                               │
+                                               ▼
+                            ┌──────────────────────────────────────┐
+                            │   Streamlit search app (port 8501)   │
+                            │  • text  → MiniLM → text events     │
+                            │  • image → CLIP   → similar images   │
+                            │  • text  → CLIP   → cross-modal      │
                             └──────────────────────────────────────┘
 ```
 
@@ -38,6 +53,8 @@ Both tracks output Parquet files in the gold layer ready for downstream ML use (
 | **Label Studio** | Manual annotation UI (text + images) |
 | **HuggingFace Transformers** | CLIP & MiniLM models |
 | **PyTorch** | Inference engine (CPU) |
+| **Qdrant** | Vector DB for similarity search |
+| **Streamlit** | Search UI (text / image / cross-modal) |
 | **Kafbat UI** | Kafka topic browser |
 
 ## Project layout
@@ -49,6 +66,10 @@ data-curator/
 │   ├── producer.py
 │   ├── Dockerfile
 │   └── requirements.txt
+├── search-app/                 # Streamlit vector search UI
+│   ├── app.py                  # 3 tabs: text / image / cross-modal
+│   ├── Dockerfile              # CPU-only torch + bakes in MiniLM + CLIP
+│   └── requirements.txt
 ├── airflow/
 │   ├── Dockerfile              # bakes CLIP weights into image
 │   ├── requirements.txt        # torch, transformers, pyarrow, ...
@@ -58,6 +79,7 @@ data-curator/
 │       ├── image_pipeline.py              # download imgs → Label Studio
 │       ├── image_embeddings.py            # annotated imgs → CLIP vectors
 │       ├── text_embeddings.py             # bronze events → MiniLM vectors
+│       ├── embeddings_to_vector_db.py     # gold Parquet → Qdrant
 │       └── facebook_events_healthcheck.py
 ├── datalake/                   # mounted into Airflow + Label Studio
 │   ├── bronze/facebook_events/dt=YYYY-MM-DD/hour=HH/*.parquet
@@ -166,6 +188,42 @@ A human annotates the images. Then DAG `image_embeddings`:
    - L2-normalise.
    - Write a single Parquet file with `task_id`, `label`, `image_path`, `embedding`.
 
+### Hop 5 — Gold Parquet → Qdrant (vector DB)
+
+DAG `embeddings_to_vector_db` reads the **latest** Parquet file from each gold folder and upserts the vectors into Qdrant. Two parallel tasks:
+
+| Task | Source | Qdrant collection | Vector dim |
+|---|---|---|---|
+| `index_text_embeddings`  | `gold/text_embeddings/embeddings_*.parquet`  | `facebook_text_events`  | 384 |
+| `index_image_embeddings` | `gold/image_embeddings/embeddings_*.parquet` | `image_classification`  | 512 |
+
+For each row a Qdrant `PointStruct` is built with:
+
+- **`id`** — deterministic UUIDv5 derived from `event_id` / `task_id` (so re-runs upsert instead of duplicating)
+- **`vector`** — the embedding
+- **`payload`** — full row metadata (label, text/image_path, actor, etc.) so you can filter at query time
+
+Points are upserted in batches of 256. Both collections use **cosine distance** (matches the L2-normalised vectors).
+
+**Example query** — find the 5 events most similar to a given embedding, filtered to `label=spam`:
+
+```python
+from qdrant_client import QdrantClient
+from qdrant_client.http.models import Filter, FieldCondition, MatchValue
+
+client = QdrantClient(url="http://localhost:6333")
+hits = client.search(
+    collection_name="facebook_text_events",
+    query_vector=my_embedding,           # 384-d list/np.array
+    limit=5,
+    query_filter=Filter(must=[
+        FieldCondition(key="label", match=MatchValue(value="spam"))
+    ]),
+)
+for h in hits:
+    print(h.score, h.payload["text"])
+```
+
 ### Volume mounts that make all of this work
 
 The same `./datalake` folder on your host is mounted into multiple containers:
@@ -176,6 +234,25 @@ The same `./datalake` folder on your host is mounted into multiple containers:
 | `/data` | `label-studio` | Label Studio serves images from here via `LOCAL_FILES_DOCUMENT_ROOT` |
 
 Because both containers see the same physical files, an image written by Airflow's `image_pipeline` is immediately visible to Label Studio without any copy step.
+
+### Hop 6 — Qdrant → Streamlit search app
+
+The `search-app` container is a self-contained Streamlit UI on port **8501**. On startup it loads two HuggingFace models that were baked into its image at build time:
+
+- **MiniLM** (`sentence-transformers/all-MiniLM-L6-v2`) for text → 384-d
+- **CLIP** (`openai/clip-vit-base-patch32`) for image → 512-d *and* text → 512-d
+
+It offers three search modes:
+
+| Tab | Input | Encoder | Collection queried |
+|---|---|---|---|
+| Text events | text query | MiniLM | `facebook_text_events` |
+| Image-by-image | image upload | CLIP image encoder | `image_classification` |
+| Cross-modal | text query | CLIP **text** encoder | `image_classification` |
+
+The cross-modal tab is the most magical bit: because CLIP's text and image encoders share the same 512-d space, you can type *"a tall building at sunset"* and Qdrant returns visually matching images — no labels required.
+
+The datalake is mounted into the search app at `/data` (read-only) so the UI can render the actual JPG files referenced by `image_path` in the Qdrant payload.
 
 ## Prerequisites
 
@@ -209,6 +286,8 @@ You should see `kafka`, `producer`, `airflow-postgres`, `airflow-init` (exited 0
 | **Airflow** | http://localhost:8080 | `airflow` / `airflow` |
 | **Label Studio** | http://localhost:8081 | `admin@datacurator.local` / `admin` |
 | **Kafbat (Kafka UI)** | http://localhost:8082 | none |
+| **Qdrant Web UI** | http://localhost:6333/dashboard | none |
+| **Search app (Streamlit)** | http://localhost:8501 | none |
 
 ### Step 3 — Generate Kafka events (automatic)
 
@@ -321,14 +400,43 @@ datalake/gold/image_embeddings/embeddings_<UTC-timestamp>.parquet
 ls -lh datalake/gold/image_embeddings/
 ```
 
+### Step 9 — Index embeddings into Qdrant
+
+Upserts the latest gold Parquet for both tracks into the Qdrant vector DB:
+
+```bash
+docker-compose exec airflow-scheduler airflow dags test embeddings_to_vector_db 2024-01-01
+```
+
+**Verify:** open http://localhost:6333/dashboard and you should see two collections:
+
+- `facebook_text_events` — N points × 384 dim
+- `image_classification` — N points × 512 dim
+
+Or from the CLI:
+
+```bash
+curl -s http://localhost:6333/collections | python -m json.tool
+```
+
+### Step 10 — Query the vectors via the search UI
+
+Open http://localhost:8501 in your browser. Three tabs:
+
+- **Text events** — type a query like `"buy cheap pills"`, optionally filter by label
+- **Image-by-image** — upload a photo, get the most visually similar images
+- **Cross-modal** — type a description (e.g. `"a tall building at sunset"`) and CLIP retrieves matching images even though the index has no captions
+
+If you don't see results, make sure Step 9 ran successfully and that Qdrant has points in both collections.
+
 ### Quick recap — DAG dependency map
 
 ```
-producer  ──► kafka_to_datalake_bronze  ──► text_embeddings           (random labelling)
-                          │
-                          └──────────────► parquet_to_label_studio    (manual labelling)
-
-image_pipeline  ──► [manual annotation]  ──► image_embeddings
+producer  ──► kafka_to_datalake_bronze  ──► text_embeddings  ──┐
+                          │                                    │
+                          └──────────────► parquet_to_label_studio
+                                                               ▼
+image_pipeline  ──► [manual annotation]  ──► image_embeddings ──► embeddings_to_vector_db  ──►  Qdrant
 ```
 
 You can run the text track end-to-end without any human labelling. The image track requires you to click through at least a few images in Label Studio.
@@ -362,7 +470,7 @@ Vectors are L2-normalised, so dot product == cosine similarity — ready for nea
 
 ```bash
 docker-compose down                # stop containers, keep data
-docker-compose down -v             # also delete Kafka + Postgres volumes
+docker-compose down -v             # also delete Kafka + Postgres + Qdrant volumes
 rm -rf datalake/bronze datalake/gold datalake/label-studio  # wipe datalake
 ```
 

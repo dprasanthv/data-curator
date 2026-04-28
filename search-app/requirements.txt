@@ -1,0 +1,5 @@
+streamlit==1.36.0
+qdrant-client==1.9.1
+torch==2.3.1
+transformers==4.41.2
+Pillow==10.3.0

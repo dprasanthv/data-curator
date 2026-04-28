@@ -11,6 +11,7 @@ x-airflow-common: &airflow-common
     LABEL_STUDIO_URL: http://label-studio:8080
     LABEL_STUDIO_USERNAME: admin@datacurator.local
     LABEL_STUDIO_PASSWORD: admin
+    QDRANT_URL: http://qdrant:6333
     AIRFLOW__WEBSERVER__SECRET_KEY: "data-curator-secret-key-change-in-prod"
   volumes:
     - ./airflow/dags:/opt/airflow/dags
@@ -133,6 +134,29 @@ services:
       - ./label-studio-data:/label-studio/data
       - ./datalake:/data
 
+  qdrant:
+    image: qdrant/qdrant:v1.9.0
+    container_name: qdrant
+    ports:
+      - "6333:6333"  # REST API + Web UI
+      - "6334:6334"  # gRPC
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+  search-app:
+    build:
+      context: ./search-app
+    container_name: search-app
+    ports:
+      - "8501:8501"
+    environment:
+      - QDRANT_URL=http://qdrant:6333
+    volumes:
+      - ./datalake:/data:ro      # for displaying images from Qdrant payload paths
+    depends_on:
+      - qdrant
+
 volumes:
   kafka_data:
   airflow_pg_data:
+  qdrant_data:
